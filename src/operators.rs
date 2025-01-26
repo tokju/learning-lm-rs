@@ -1,5 +1,7 @@
 use crate::tensor::Tensor;
 
+use rayon::prelude::*;
+
 // get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     let length = indices.size();
@@ -71,25 +73,96 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    // todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    assert!(y.size() == x.size());
+
+    let n = x.shape().last().copied().unwrap_or(0);
+    let batch = x.size() / n;
+
+    let y_data = unsafe { y.data_mut() };
+    let x_data = x.data();
+    let w_data = w.data();
+
+    for i in 0..batch {
+        let offset = i * n;
+
+        // Rayon Parller
+        let mut s: f32 = (offset..n+offset).into_par_iter()
+            .map(|i| x_data[i].powi(2)).sum();
+
+        s = (s / n as f32 + epsilon).sqrt();
+
+        for j in 0..n {
+            y_data[offset + j] = w_data[j] * x_data[offset + j] / s;
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+
+    // for i in 0..len {
+    //     _y[i] *= _x[i] / (1.0 + (-_x[i]).exp())
+    // }
+
+    // Rayon Paraller
+    _y.par_iter_mut()
+        .zip(_x.par_iter())
+        .for_each(|(y, x)| *y *= x / (1.0 + (-x).exp()));
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    // todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    assert!(a.shape().len() == 2);
+    assert!(b.shape().len() == 2);
+    assert!(c.shape().len() == 2);
+
+    let (a_r, a_c) = (a.shape()[0], a.shape()[1]);
+    let (b_r, b_c) = (b.shape()[0], b.shape()[1]);
+    let (c_r, c_c) = (c.shape()[0], c.shape()[1]);
+
+    assert!(a_c == b_c);
+    assert!(a_r == c_r && b_r == c_c);
+
+    let _a = a.data();
+    let _b = b.data();
+    let _c = unsafe { c.data_mut() };
+
+    // for i in 0..c_r {
+    //     for j in 0..c_c {
+    //         let mut s = 0.0;
+    //         for k in 0..a_c {
+    //             s += _a[i * a_c + k] * _b[j * b_c + k];
+    //         }
+    //         _c[i * c_c + j] = beta * _c[i * c_c + j] + alpha * s;
+    //     }
+    // }
+
+    // Rayon Parller
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+
+    pool.scope(|s| {
+        for (a, c) in _a.chunks(a_c).zip(_c.chunks_mut(c_c)) {
+            s.spawn(|_| {
+                for (b, cc) in _b.chunks(b_c).zip(c.iter_mut()) {
+                    let d = b.iter()
+                        .zip(a.iter())
+                        .fold(0.,|s, (aa, bb)| s + aa * bb);
+                    *cc = beta * (*cc) + alpha * d;
+                }
+            })
+        }
+    })
 }
 
 // Dot product of two tensors (treated as vectors)

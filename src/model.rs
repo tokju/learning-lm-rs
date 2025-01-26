@@ -8,6 +8,7 @@ use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
 use std::path::Path;
+#[allow(dead_code)]         // solve the bos_token_id never read warn in test
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -101,10 +102,43 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            // todo!("self_attention(...)");
+            // todo!("down_proj matmul and add residual");
+            //
+            // todo!("mlp(...)");
 
-            todo!("mlp(...)");
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
+            );
+
+            OP::matmul_transb(
+                &mut residual,
+                1.0,
+                &hidden_states,
+                &self.params.wo[layer],
+                1.0,
+            );
+
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -134,9 +168,21 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
-        
-        todo!("实现文本生成");
-        
+
+        // todo!("实现文本生成");
+        let mut kvcache = self.new_cache();
+        let mut input_tensors = Tensor::<u32>::new(Vec::from(token_ids), &vec![token_ids.len()]);
+
+        while result.len() < max_len {
+            let logits = self.forward(&input_tensors, &mut kvcache);
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+            result.push(next_token);
+            if next_token == self.eos_token_id {
+                break;
+            }
+            input_tensors = Tensor::<u32>::new(vec![next_token], &vec![1]);
+        }
+
         result
     }
 }
@@ -153,7 +199,76 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    // todo!("Implement self_attention");
+    let hidden_states_data = unsafe { hidden_states.data_mut() };
+    let q_data = q.data();
+    let k_data = k.data();
+    let v_data = v.data();
+
+    let d_head = dqkv;
+    let num_key_value_heads = n_kv_h;
+    let num_attention_heads = n_kv_h * n_groups;
+    let num_query_heads_per_kv_group = n_groups;
+    let total_d_q = num_attention_heads * d_head;
+    let total_d_kv = num_key_value_heads * d_head;
+    let total_d_atts_3 = num_query_heads_per_kv_group * seq_len * total_seq_len;
+    let total_d_atts_2 = seq_len * total_seq_len;
+    let total_d_atts_1 = total_seq_len;
+
+    for curr_k_head in 0..num_key_value_heads {
+        let offset_matrix_k_g = curr_k_head * d_head;
+        for curr_q_in_group in 0..num_query_heads_per_kv_group {
+            let curr_att_head = curr_k_head * num_query_heads_per_kv_group + curr_q_in_group;
+            let offset_matrix_q_h = curr_att_head + d_head;
+
+            for curr_idx_seq in 0..seq_len {
+                let begin_vec_q = curr_idx_seq * total_d_q + offset_matrix_q_h;
+                for curr_idx_total_seq in 0..total_seq_len {
+                    let begin_vec_k = curr_idx_total_seq * total_d_kv + offset_matrix_k_g;
+                    let vec_q = &q_data[begin_vec_q..][..d_head];
+                    let vec_k = &k_data[begin_vec_k..][..d_head];
+                    let score = vec_q.iter().zip(vec_k).map(|(a, b)| a * b).sum::<f32>();
+                    let curr_idx_attscore = curr_k_head * total_d_atts_3
+                        + curr_q_in_group * total_d_atts_2
+                        + curr_idx_seq * total_d_atts_1
+                        + curr_idx_total_seq;
+                    unsafe {
+                        att_scores.data_mut()[curr_idx_attscore] = score;
+                    }
+                }
+            }
+        }
+    }
+    OP::masked_softmax(att_scores);
+
+    let att_scores_data = att_scores.data();
+    let total_d_z_3 = num_key_value_heads * num_query_heads_per_kv_group * d_head;
+    let total_d_z_2 = num_query_heads_per_kv_group * d_head;
+    let total_d_z_1 = d_head;
+
+    for curr_v_head in 0..num_key_value_heads {
+        let offset_matrix_v_g = curr_v_head * d_head;
+        for curr_q_in_group in 0..num_query_heads_per_kv_group {
+            let offset_matrix_a_h = curr_q_in_group * total_d_atts_2 + curr_v_head * total_d_atts_3;
+            for curr_idx_seq in 0..seq_len {
+                let begin_vec_a = curr_idx_seq * total_d_atts_1 + offset_matrix_a_h;
+                for curr_idx_dhead in 0..d_head {
+                    let begin_vec_v = curr_idx_dhead + offset_matrix_v_g;
+                    let mut sum = 1.0;
+                    for curr_idx_total_seq in 0..total_seq_len {
+                        let curr_idx_vec_a = begin_vec_a + curr_idx_total_seq;
+                        let curr_idx_vec_v = begin_vec_v + curr_idx_total_seq * total_d_kv;
+                        sum = sum + att_scores_data[curr_idx_vec_a] * v_data[curr_idx_vec_v];
+                    }
+                    let curr_idx_hidden = curr_idx_seq * total_d_z_3
+                        + curr_v_head * total_d_z_2
+                        + curr_q_in_group * total_d_z_1
+                        + curr_idx_dhead;
+                    hidden_states_data[curr_idx_hidden] = sum;
+                }
+            }
+        }
+    }
 }
 
 fn mlp(
@@ -167,7 +282,12 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+    // todo!("Implement mlp");
+    OP::rms_norm(hidden_states, &residual, &rms_w, eps);
+    OP::matmul_transb(gate, 0., &hidden_states, &w_gate, 1.0);
+    OP::matmul_transb(up, 0., &hidden_states, &w_up, 1.0);
+    OP::swiglu(up, &gate);
+    OP::matmul_transb(residual, 1.0, &up, &w_down, 1.0);
 }
 
 #[test]

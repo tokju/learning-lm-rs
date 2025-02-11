@@ -10,3 +10,8 @@ safetensors = "0.4.3"
 tokenizers = "0.19.1"
 rand = "0.8"
 rayon = "1.10.0"
+criterion = "0.5.1"
+
+[[bench]]
+name = "benchmarks"
+harness = false
